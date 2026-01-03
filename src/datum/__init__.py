@@ -4,6 +4,7 @@ from typing import Literal, Dict, Any
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 logger = logging.getLogger("datum")
@@ -16,9 +17,9 @@ class Datum:
 
     Responsibilities
     ----------------
-    - Download raw OHLCV + corporate actions from Yahoo Finance
+    - Download raw OHLCV + corporate actions (if available)
     - Clean, validate, and normalize all data
-    - Explicitly adjust prices using:
+    - Explicitly adjust prices (where applicable) using:
 
         adjustment_factor_t = AdjClose_t / Close_t
 
@@ -27,6 +28,8 @@ class Datum:
 
     - Enforce strict schema, typing, determinism, and auditability
     """
+
+    BINANCE_BASE_URL = "https://data-api.binance.vision"  # public market-data base
 
     def __init__(
         self,
@@ -39,6 +42,7 @@ class Datum:
         calendar: Literal["exchange", "business"] = "exchange",
         timezone: str = "UTC",
         retry_attempts: int = 1,
+        asset_class: Literal["Equities", "Crypto"] = "Equities",
     ):
         self.tickers = sorted(set(tickers))
         self.start = start
@@ -49,6 +53,7 @@ class Datum:
         self.calendar = calendar
         self.timezone = timezone
         self.retry_attempts = retry_attempts
+        self.asset_class = asset_class
 
         self._raw: pd.DataFrame | None = None
         self._prices: pd.DataFrame | None = None
@@ -58,6 +63,7 @@ class Datum:
             "missing_data_actions": [],
             "corporate_actions": {},
             "adjustment_checks": {},
+            "source": asset_class,
         }
 
         self._load()
@@ -66,6 +72,19 @@ class Datum:
     # DATA ACQUISITION
     # ------------------------------------------------------------------
     def _load(self) -> None:
+        if self.asset_class == "Equities":
+            self._raw = self._download_yahoo()
+        elif self.asset_class == "Crypto":
+            self._raw = self._download_binance()
+        else:
+            raise ValueError("asset_class must be 'Equities' or 'Crypto'")
+
+        if self._raw is None or self._raw.empty:
+            raise RuntimeError("Failed to download market data")
+
+        self._process()
+
+    def _download_yahoo(self) -> pd.DataFrame:
         last_exc: Exception | None = None
 
         for attempt in range(1, self.retry_attempts + 1):
@@ -80,28 +99,135 @@ class Datum:
                     actions=True,
                     threads=False,
                 )
-
-                if data.empty:
+                if data is None or data.empty:
                     raise ValueError("Empty download from Yahoo Finance")
 
-                self._raw = data
-                break
+                # Normalize to MultiIndex columns: (ticker, field)
+                if not isinstance(data.columns, pd.MultiIndex):
+                    # single-ticker case
+                    if len(self.tickers) != 1:
+                        raise RuntimeError("Unexpected Yahoo column format for multiple tickers")
+                    t = self.tickers[0]
+                    data.columns = pd.MultiIndex.from_product([[t], list(data.columns)])
+
+                return data
 
             except Exception as exc:
                 last_exc = exc
-                logger.warning(
-                    {
-                        "event": "download_failure",
-                        "attempt": attempt,
-                        "error": str(exc),
-                    }
-                )
+                logger.warning({"event": "download_failure", "source": "yahoo", "attempt": attempt, "error": str(exc)})
                 time.sleep(1)
 
-        if self._raw is None:
-            raise RuntimeError("Failed to download market data") from last_exc
+        raise RuntimeError("Failed to download market data from Yahoo Finance") from last_exc
 
-        self._process()
+    def _download_binance(self) -> pd.DataFrame:
+        last_exc: Exception | None = None
+
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                frames: list[pd.DataFrame] = []
+                for symbol in self.tickers:
+                    df = self._binance_fetch_klines(symbol=symbol, interval=self._binance_interval(self.freq))
+                    # Map into the same “raw” schema Yahoo provides
+                    raw = pd.DataFrame(
+                        {
+                            "Open": df["open"],
+                            "High": df["high"],
+                            "Low": df["low"],
+                            "Close": df["close"],
+                            "Adj Close": df["close"],         # no corporate-action adj for crypto spot
+                            "Volume": df["volume"],
+                            "Dividends": 0.0,
+                            "Stock Splits": 0.0,
+                        },
+                        index=df.index,
+                    )
+                    raw.columns = pd.MultiIndex.from_product([[symbol], list(raw.columns)])
+                    frames.append(raw)
+
+                if not frames:
+                    raise RuntimeError("No crypto symbols returned data from Binance")
+
+                return pd.concat(frames, axis=1).sort_index(axis=1)
+
+            except Exception as exc:
+                last_exc = exc
+                logger.warning({"event": "download_failure", "source": "binance", "attempt": attempt, "error": str(exc)})
+                time.sleep(1)
+
+        raise RuntimeError("Failed to download market data from Binance") from last_exc
+
+    def _binance_interval(self, freq: str) -> str:
+        # Datum freq stays the same; only Binance needs mapping
+        mapping = {"1d": "1d", "1wk": "1w", "1mo": "1M"}
+        if freq not in mapping:
+            raise ValueError(f"Unsupported freq for Binance: {freq}")
+        return mapping[freq]
+
+    def _binance_fetch_klines(self, symbol: str, interval: str) -> pd.DataFrame:
+        start_ts = pd.Timestamp(self.start)
+        end_ts = pd.Timestamp(self.end)
+
+        # Make timestamps explicit UTC
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
+        else:
+            start_ts = start_ts.tz_convert("UTC")
+
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        else:
+            end_ts = end_ts.tz_convert("UTC")
+
+        start_ms = int(start_ts.timestamp() * 1000)
+        end_ms = int(end_ts.timestamp() * 1000)
+
+        url = f"{self.BINANCE_BASE_URL}/api/v3/klines"
+        out: list[list[Any]] = []
+
+        while start_ms < end_ms:
+            r = requests.get(
+                url,
+                params={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "limit": 1000,
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+
+            out.extend(batch)
+            start_ms = int(batch[-1][0]) + 1  # advance 1ms to avoid duplicates
+            time.sleep(0.05)
+
+        if not out:
+            raise ValueError(f"Empty download from Binance for {symbol}")
+
+        # Only keep the fields we actually need (avoid dtype issues from other columns)
+        df = pd.DataFrame(out, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_volume","n_trades",
+            "taker_buy_base_volume","taker_buy_quote_volume","ignore",
+        ])[["open_time", "open", "high", "low", "close", "volume"]]
+
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df = df.set_index("open_time").sort_index()
+        df = df[~df.index.duplicated(keep="first")]
+
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Check only the numeric fields we care about
+        if df[["open", "high", "low", "close", "volume"]].isna().any().any():
+            raise ValueError(f"NaNs after numeric coercion for {symbol} (Binance)")
+
+        return df
+
 
     # ------------------------------------------------------------------
     # PROCESSING PIPELINE
@@ -110,10 +236,9 @@ class Datum:
         frames: list[pd.DataFrame] = []
 
         for ticker in self.tickers:
-            if ticker not in self._raw.columns.get_level_values(0):
-                logger.warning(
-                    {"event": "missing_ticker", "ticker": ticker}
-                )
+            # _raw must be MultiIndex (ticker, field)
+            if not isinstance(self._raw.columns, pd.MultiIndex) or ticker not in self._raw.columns.get_level_values(0):
+                logger.warning({"event": "missing_ticker", "ticker": ticker})
                 continue
 
             df = self._raw[ticker].copy()
@@ -136,7 +261,6 @@ class Datum:
                 "Dividends",
                 "Stock Splits",
             ]
-
             for col in required:
                 if col not in df.columns:
                     df[col] = np.nan
@@ -153,15 +277,9 @@ class Datum:
 
             zero_vol = int((df["Volume"] == 0).sum())
             if zero_vol > 0:
-                logger.warning(
-                    {
-                        "event": "zero_volume_days",
-                        "ticker": ticker,
-                        "count": zero_vol,
-                    }
-                )
+                logger.warning({"event": "zero_volume_days", "ticker": ticker, "count": zero_vol})
 
-            # explicit adjustment
+            # explicit adjustment (crypto will have Adj Close == Close)
             with np.errstate(divide="ignore", invalid="ignore"):
                 adj_factor = df["Adj Close"] / df["Close"]
 
@@ -185,48 +303,31 @@ class Datum:
 
                 if self.dropna_policy == "forward":
                     adjusted = adjusted.ffill()
-                    self._metadata["missing_data_actions"].append(
-                        {"ticker": ticker, "action": "forward_fill"}
-                    )
+                    self._metadata["missing_data_actions"].append({"ticker": ticker, "action": "forward_fill"})
 
                 if self.dropna_policy == "interpolate":
                     adjusted = adjusted.interpolate(method="time")
-                    self._metadata["missing_data_actions"].append(
-                        {"ticker": ticker, "action": "interpolate"}
-                    )
+                    self._metadata["missing_data_actions"].append({"ticker": ticker, "action": "interpolate"})
 
             # calendar alignment
             if self.calendar == "business":
-                idx = pd.date_range(
-                    adjusted.index.min(),
-                    adjusted.index.max(),
-                    freq="B",
-                    tz="UTC",
-                )
+                idx = pd.date_range(adjusted.index.min(), adjusted.index.max(), freq="B", tz="UTC")
                 adjusted = adjusted.reindex(idx)
 
-            adjusted.columns = pd.MultiIndex.from_product(
-                [[ticker], adjusted.columns]
-            )
+            adjusted.columns = pd.MultiIndex.from_product([[ticker], adjusted.columns])
             frames.append(adjusted)
 
-            self._metadata["coverage"][ticker] = {
-                "start": str(adjusted.index.min()),
-                "end": str(adjusted.index.max()),
-            }
+            self._metadata["coverage"][ticker] = {"start": str(adjusted.index.min()), "end": str(adjusted.index.max())}
 
+            # crypto has no dividends/splits in this interface
             self._metadata["corporate_actions"][ticker] = {
-                "dividends": float(df["Dividends"].sum()),
-                "splits": int((df["Stock Splits"] != 0).sum()),
+                "dividends": float(df["Dividends"].sum(skipna=True)),
+                "splits": int((df["Stock Splits"].fillna(0) != 0).sum()),
             }
 
             self._metadata["adjustment_checks"][ticker] = {
                 "adj_close_match": bool(
-                    np.allclose(
-                        adjusted[(ticker, "close_adj")],
-                        df["Adj Close"],
-                        equal_nan=True,
-                    )
+                    np.allclose(adjusted[(ticker, "close_adj")], df["Adj Close"], equal_nan=True)
                 )
             }
 
