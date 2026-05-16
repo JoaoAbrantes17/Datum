@@ -38,4 +38,4 @@ def get_provider(name: str) -> BaseProvider:
 
 
 # Trigger provider registration at import time
-from datum.providers import yahoo, binance, xbbg  # noqa: E402, F401
+from datum.providers import yahoo, binance  # noqa: E402, F401
