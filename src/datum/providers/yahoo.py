@@ -70,7 +70,7 @@ class YahooProvider(BaseProvider):
         if not frames:
             raise DatumFetchError("No valid ticker data from Yahoo Finance")
 
-        return pd.concat(frames, axis=1).sort_index(axis=1)
+        return pd.concat(frames, axis=1)
 
 
 register("yahoo", YahooProvider)

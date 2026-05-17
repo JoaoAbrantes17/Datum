@@ -1,6 +1,5 @@
 import logging
-import warnings
-from typing import Any, Dict, Literal
+from typing import Any, Dict
 
 import pandas as pd
 
@@ -8,6 +7,7 @@ from datum._types import CalendarLiteral, FreqLiteral, PolicyLiteral, ProviderLi
 from datum.exceptions import DatumFetchError
 from datum.pipeline import process_ticker
 from datum.providers import get_provider
+from datum.schema import CANONICAL_FIELDS
 
 logger = logging.getLogger("datum")
 logger.setLevel(logging.INFO)
@@ -35,18 +35,7 @@ class Datum:
         calendar: CalendarLiteral = "exchange",
         timezone: str = "UTC",
         retry_attempts: int = 1,
-        # Deprecated — kept for backward compatibility
-        asset_class: Literal["Equities", "Crypto"] | None = None,
     ):
-        # Backward-compat shim
-        if asset_class is not None:
-            warnings.warn(
-                "asset_class is deprecated. Use provider='yahoo' or provider='binance'.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            provider = {"Equities": "yahoo", "Crypto": "binance"}[asset_class]
-
         self.tickers = sorted(set(tickers))
         self.start = start
         self.end = end
@@ -111,7 +100,9 @@ class Datum:
         if not frames:
             raise RuntimeError("No valid ticker data available")
 
-        self._prices = pd.concat(frames, axis=1).sort_index(axis=1)
+        prices = pd.concat(frames, axis=1)
+        columns = pd.MultiIndex.from_product([self.tickers, CANONICAL_FIELDS])
+        self._prices = prices.reindex(columns=columns)
 
     # ------------------------------------------------------------------
     # PUBLIC API
